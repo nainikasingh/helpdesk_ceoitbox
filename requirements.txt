@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pandas
+gspread
+sentence-transformers
+faiss-cpu
+torch
+python-dotenv
+fuzzywuzzy
