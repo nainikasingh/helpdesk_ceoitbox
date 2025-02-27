@@ -7,3 +7,13 @@ faiss-cpu
 torch
 python-dotenv
 fuzzywuzzy
+cupy-cuda12x
+spacy
+thinc[torch]
+nltk
+numpy
+pydantic
+scikit-learn
+transformers
+sentencepiece
+protobuf
