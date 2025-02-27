@@ -7,7 +7,7 @@ import logging
 from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
 import numpy as np
-from transformers import pipeline
+from transformers import pipeline, T5Tokenizer, T5ForConditionalGeneration
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
 import re
@@ -22,17 +22,29 @@ nltk.download('stopwords')
 # Initialize FastAPI app
 app = FastAPI()
 
-# Load NLP models
-nlp = spacy.load("en_core_web_sm")
-sentence_transformers.SENTENCE_TRANSFORMERS_HOME = "./models"
-embedder = SentenceTransformer("multi-qa-mpnet-base-dot-v1")  # Transformer for embedding
-zero_shot_classifier = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
+# Load Fine-Tuned NLP Models
+nlp = spacy.load("./spacy_model/model-best")  # Load fine-tuned spaCy NER model
+embedder = SentenceTransformer("./fine_tuned_sentence_transformer")  # Load fine-tuned FAISS model
+
+# Load fine-tuned T5 model
+t5_tokenizer = T5Tokenizer.from_pretrained("./fine_tuned_t5")
+t5_model = T5ForConditionalGeneration.from_pretrained("./fine_tuned_t5")
 
 # Google Sheets authentication
 gc = gspread.service_account(filename='service_account.json')  # Update with correct credentials
 
 # Static Google Sheet URL
 SHEET_URL = "https://docs.google.com/spreadsheets/d/1-5ao5vcVOSCyD91TUgPSPYAOOv5f_Cxt5zKDwM7mwg0/edit?usp=sharing"
+USER_QUERY_SHEET_NAME = "UserQueries"
+
+def get_user_query_sheet():
+    try:
+        sheet = gc.open_by_url(SHEET_URL)
+        worksheet = sheet.worksheet(USER_QUERY_SHEET_NAME)
+    except gspread.exceptions.WorksheetNotFound:
+        worksheet = sheet.add_worksheet(title=USER_QUERY_SHEET_NAME, rows="1000", cols="2")
+        worksheet.append_row(["Query", "Timestamp"])
+    return worksheet
 
 # Preprocessing function
 def preprocess_text(text):
@@ -47,31 +59,22 @@ def load_sheets_data():
     sheet = gc.open_by_url(SHEET_URL).sheet1
     data = sheet.get_all_values()
     df = pd.DataFrame(data)
-    
-    # Set the correct header row
     df.columns = df.iloc[0]  # Use the first row as the header
-    df = df[2:]  # Skip the rows above the actual data
-    df = df.reset_index(drop=True)
-    
-    # Ensure column names are trimmed of extra spaces
+    df = df[2:].reset_index(drop=True)  # Skip metadata rows
     df.columns = df.columns.str.strip()
-    
-    # Print column names for debugging
-    logging.info("Columns in the dataframe: %s", df.columns.tolist())
-    
-    # Check available columns before dropping
-    expected_columns = ["Sheet Name", "Issue Text", "Solution Text", "Solution Image"]
-    missing_columns = [col for col in expected_columns if col not in df.columns]
-    if missing_columns:
-        raise KeyError(f"Missing expected columns: {missing_columns}")
-    
-    # Clean up and filter necessary columns
-    df = df.dropna(subset=["Issue Text", "Solution Text"])
+    df = df.dropna(subset=["Issue Text", "Solution Text", "Solution Image", "Sheet Name"])
     df['processed_text'] = df['Issue Text'].apply(preprocess_text)
-    
     return df
 
-# Create FAISS index (cached)
+# Extract sheet names from queries
+def extract_sheet_names(query, available_sheets):
+    detected_sheets = []
+    for sheet in available_sheets:
+        if sheet.lower() in query.lower():
+            detected_sheets.append(sheet)
+    return detected_sheets
+
+# Create FAISS index
 def create_faiss_index(sentences):
     embeddings = np.array([embedder.encode(sent) for sent in sentences], dtype=np.float32)
     dimension = embeddings.shape[1]
@@ -79,56 +82,43 @@ def create_faiss_index(sentences):
     index.add(embeddings)
     return index, embeddings
 
-# Search function using FAISS (vectorized and optimized)
+# Search function using FAISS
 def search_query(query, df, index, embeddings):
     query_embedding = embedder.encode([query]).astype(np.float32)
     _, faiss_result = index.search(query_embedding, 3)
-    keyword_results = df[df['processed_text'].str.contains(query, case=False, na=False)][['Solution Text', 'Sheet Name', 'Solution Image']]
-    
-    solutions = []
-    for idx in faiss_result[0]:
-        row = df.iloc[idx]
-        solutions.append(f"{row['Solution Text']} {{in {row['Sheet Name']}}}")
-        solutions.append(f"Solution Image: {row['Solution Image']}")
-    
-    for _, row in keyword_results.iterrows():
-        solutions.append(f"{row['Solution Text']} {{in {row['Sheet Name']}}}")
-        solutions.append(f"Solution Image: {row['Solution Image']}")
-    
+    solutions = [(df.iloc[idx]['Solution Text'], df.iloc[idx]['Solution Image'], df.iloc[idx]['Sheet Name']) for idx in faiss_result[0] if idx < len(df)]
     return solutions
 
-# Extract entities from queries (asynchronous execution)
-def extract_entities(query):
-    doc = nlp(query)
-    return [ent.text for ent in doc.ents]
-
-# Improved Sheet Name Matching
-def match_sheet_name(query, available_sheets):
-    best_match, score = process.extractOne(query, available_sheets)
-    if score > 80:  # Adjust threshold as needed
-        return best_match
-    return None
+# Store user query for fine-tuning
+def store_user_query(query):
+    try:
+        worksheet = get_user_query_sheet()
+        worksheet.append_row([query, pd.Timestamp.now().isoformat()])
+    except Exception as e:
+        logging.error(f"Failed to store user query: {str(e)}")
 
 @app.get("/query")
 async def get_solution(query: str):
     try:
+        store_user_query(query)  # Collect query for fine-tuning
         df = load_sheets_data()
-        available_sheets = [ws.title for ws in gc.open_by_url(SHEET_URL).worksheets()]
+        available_sheets = df['Sheet Name'].unique().tolist()
+        detected_sheets = extract_sheet_names(query, available_sheets)
+        index, embeddings = create_faiss_index(df['processed_text'].tolist())
+        solutions = search_query(query, df, index, embeddings)
         
-        extracted_entities = extract_entities(query)
-        matched_sheet = match_sheet_name(query, available_sheets)
-        
-        if matched_sheet:
-            df = df[df["Sheet Name"] == matched_sheet]
-            solutions = search_query(query, df, *create_faiss_index(df['processed_text'].tolist()))
-        else:
-            solutions = search_query(query, df, *create_faiss_index(df['processed_text'].tolist()))
+        if detected_sheets:
+            exact_match = [sol for sol in solutions if sol[2] in detected_sheets]
+            if exact_match:
+                return {"message": "Here is your solution:", "solutions": [{"text": sol[0], "image": sol[1], "sheet": sol[2]} for sol in exact_match]}
+            else:
+                return {"message": "Sheet name is incorrect, but here are solutions to similar errors:", "solutions": [{"text": sol[0], "image": sol[1], "sheet": sol[2]} for sol in solutions]}
         
         if not solutions:
-            logging.warning(f"Low confidence query: {query}")
-            return {"message": "No direct solution found. Please refine your query."}
+            solution_text = "No direct solution found. Please refine your query."
+            return {"message": solution_text, "solutions": []}
         
-        return {"solutions": solutions, "entities": extracted_entities}
+        return {"message": "Sheet name not mentioned, here are solutions:", "solutions": [{"text": sol[0], "image": sol[1], "sheet": sol[2]} for sol in solutions]}
     except Exception as e:
         logging.error(f"Error processing query: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
