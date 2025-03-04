@@ -12,10 +12,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Expose the port FastAPI will run on
-EXPOSE 8000
+EXPOSE 8080
 
 # Environment variable for Google Service Account
 ENV GOOGLE_APPLICATION_CREDENTIALS="/app/service_account.json"
 
 # Command to run the FastAPI application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", "--reload"]
